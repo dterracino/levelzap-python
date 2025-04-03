@@ -3,6 +3,7 @@ import os
 import sys
 import shutil
 import json
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
@@ -26,6 +27,7 @@ def parse_args():
     group.add_argument("-o", "--overwrite", action="store_true", help="Allow overwriting files/folders (destructive; ask for confirmation)")
 
     parser.add_argument("--update", action="store_true", help="Check for a newer version of LevelZap on GitHub")
+    parser.add_argument("--verify", action="store_true", help="Verify integrity of all LevelZap log files")
     return parser.parse_args()
 
 def ensure_valid_directory(path):
@@ -125,23 +127,42 @@ def flatten_folder(root: Path, simulate=False, merge=False, overwrite=False):
                 perform_action(simulate, "move", src=item, dst=destination, log=actions)
                 pbar.update(1)
             perform_action(simulate, "delete_folder", src=folder, log=actions)
-    if not simulate:
-        log_path = root / log_file
-        with open(log_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "version": LEVELZAP_VERSION,
-                "log_timestamp": datetime.now().isoformat(),
-                "actions": actions
-            }, f, indent=2)
-        print(f"\n📝 Log written to: {log_path}")
+    log_path = root / log_file
+    with open(log_path, "w", encoding="utf-8") as f:
+        log_content = {
+            "version": LEVELZAP_VERSION,
+            "log_timestamp": datetime.now().isoformat(),
+            "simulated": simulate,
+            "actions": actions
+        }
+        log_bytes = json.dumps(log_content, indent=2).encode("utf-8")
+        log_hash = hashlib.sha256(log_bytes).hexdigest()
+        log_content["hash"] = log_hash
+        f.write(json.dumps(log_content, indent=2))
+
+    if simulate:
+        print(f"\n📝 Simulation complete. Log saved to: {log_path}")
     else:
-        print(f"\n📝 Simulation complete. No changes made.")
+        print(f"\n📝 Log written to: {log_path}")
 
 def revert_log(log_path: Path, keep_log=False):
     print(f"♻️  Reverting changes using log: {log_path}\n")
     try:
         with open(log_path, "r", encoding="utf-8") as f:
             log_data = json.load(f)
+        if log_data.get("simulated"):
+            print("❌ Cannot revert a simulated log file.")
+            return
+        stored_hash = log_data.get("hash")
+        temp_hash_data = dict(log_data)
+        temp_hash_data.pop("hash", None)
+        computed_hash = hashlib.sha256(json.dumps(temp_hash_data, indent=2).encode("utf-8")).hexdigest()
+        if stored_hash != computed_hash:
+            print(f"{Fore.RED}❌ Log file integrity check failed. Possible modification detected.{Style.RESET_ALL}")
+            return
+        else:
+            print(f"{Fore.GREEN}✅ Log file passed integrity check.{Style.RESET_ALL}")
+            return
         actions = log_data.get("actions", [])
     except Exception as e:
         print(f"❌ Failed to read log file: {e}")
@@ -181,6 +202,27 @@ def revert_all_logs(folder: Path, keep_logs=False):
     for log_file in log_files:
         revert_log(log_file, keep_log=keep_logs)
 
+def verify_all_logs(folder: Path):
+    log_files = sorted(folder.glob("levelzap_log_*.json"))
+    if not log_files:
+        print("❌ No log files found to verify.")
+        return
+
+    for log_file in log_files:
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                log_data = json.load(f)
+            stored_hash = log_data.get("hash")
+            temp_data = dict(log_data)
+            temp_data.pop("hash", None)
+            computed_hash = hashlib.sha256(json.dumps(temp_data, indent=2).encode("utf-8")).hexdigest()
+            if stored_hash == computed_hash:
+                print(f"{Fore.GREEN}✅ {log_file.name} passed integrity check{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}❌ {log_file.name} failed integrity check!{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}❌ Failed to verify {log_file.name}: {e}{Style.RESET_ALL}")
+
 def check_for_update():
     url = "https://api.github.com/repos/dterracino/levelzap-python/releases/latest"
     try:
@@ -200,9 +242,14 @@ def main():
     print(f"{Fore.GREEN}Visit https://github.com/dterracino/levelzap-python for updates{Style.RESET_ALL}\n")
     args = parse_args()
 
+    if args.verify:
+        verify_all_logs(Path(args.target).resolve())
+        sys.exit(0)
+
     if args.update:
         check_for_update()
         sys.exit(0)
+
     target_path = Path(args.target).resolve()
     ensure_valid_directory(target_path)
     if args.revert_all:

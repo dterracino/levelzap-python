@@ -10,7 +10,7 @@ from tqdm import tqdm
 from colorama import Fore, Style
 import urllib.request
 
-LEVELZAP_VERSION = "0.2"
+LEVELZAP_VERSION = "0.3"
 
 def parse_args():
     parser = argparse.ArgumentParser(

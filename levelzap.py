@@ -219,9 +219,13 @@ def verify_all_logs(folder: Path):
         try:
             with open(log_file, "r", encoding="utf-8") as f:
                 log_data = json.load(f)
-            stored_hash = log_data.get("hash")
-            temp_data = dict(log_data)
-            temp_data.pop("hash", None)
+            stored_hash = log_data.get("meta", {}).get("hash")
+            meta_copy = dict(log_data.get("meta", {}))
+            meta_copy.pop("hash", None)
+            temp_data = {
+                "meta": meta_copy,
+                "actions": log_data.get("actions", [])
+            }
             computed_hash = hashlib.sha256(json.dumps(temp_data, indent=2).encode("utf-8")).hexdigest()
             if stored_hash == computed_hash:
                 print(f"{Fore.GREEN}✅ {log_file.name} passed integrity check{Style.RESET_ALL}")

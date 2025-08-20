@@ -16,7 +16,7 @@ empty directories and stores a log so actions can be reverted.
 ### Common options
 
 #### Core Operations
-- `-s`, `--simulate` – perform a dry run without changing files.
+- `-s`, `--dry-run` – perform a dry run without changing files.
 - `-m`, `--merge` – merge folders if names conflict.
 - `-o`, `--overwrite` – overwrite existing files or folders (destructive).
 - `-r`, `--revert` – revert the most recent operation using the last log file.
@@ -35,7 +35,7 @@ empty directories and stores a log so actions can be reverted.
 Example dry run:
 
 ```bash
-python levelzap.py -m --simulate
+python levelzap.py -m --dry-run
 ```
 
 ### Analysis Examples

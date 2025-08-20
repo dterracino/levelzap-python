@@ -131,7 +131,7 @@ def parse_args():
         description="📂 LevelZap - Flatten subfolders up one level and clean up."
     )
     parser.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir)")
-    parser.add_argument("-s", "--simulate", action="store_true", help="Simulate actions without making changes")
+    parser.add_argument("-s", "--dry-run", action="store_true", help="Simulate actions without making changes")
     parser.add_argument("-r", "--revert", action="store_true", help="Revert the most recent log file")
     parser.add_argument("-ra", "--revert-all", action="store_true", help="Revert all previous operations in reverse order")
     parser.add_argument("-kl", "--keep-logs", action="store_true", help="Preserve log files after reversion (they will be marked as reverted)")
@@ -489,7 +489,7 @@ def display_user_selections(args, output_manager):
     output_manager.print_info("🔧 Operation Details:")
     output_manager.print_info(f"   Target directory: {args.target}")
     
-    if args.simulate:
+    if args.dry_run:
         output_manager.print_info("   Mode: 🔍 Simulation (no changes will be made)")
     
     if args.recurse:
@@ -577,7 +577,7 @@ def main():
             
             flatten_folder(
                 target_path,
-                simulate=args.simulate,
+                simulate=args.dry_run,
                 merge=args.merge,
                 overwrite=args.overwrite,
                 output_manager=output_manager

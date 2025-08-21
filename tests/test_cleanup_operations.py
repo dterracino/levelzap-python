@@ -263,3 +263,110 @@ def test_error_handling():
         # Check log file was created
         log_files = list(tmp_path.glob("levelzap.log.*.json"))
         assert len(log_files) == 1
+
+
+def test_revert_empty_folder_removal():
+    """Test that reverting empty folder removal recreates the folders"""
+    output_manager = OutputManager()
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        
+        # Create empty folder
+        empty_folder = tmp_path / "empty_folder"
+        empty_folder.mkdir()
+        
+        # Remove empty folders (not simulation)
+        remove_empty_folders(tmp_path, simulate=False, recurse=True, output_manager=output_manager)
+        
+        # Verify folder was removed
+        assert not empty_folder.exists()
+        
+        # Get the log file
+        log_files = list(tmp_path.glob("levelzap.log.*.json"))
+        assert len(log_files) == 1
+        
+        # Import revert function
+        from levelzap import revert_log
+        
+        # Revert the operation
+        revert_log(log_files[0], keep_log=False, output_manager=output_manager)
+        
+        # Verify folder was recreated
+        assert empty_folder.exists()
+        assert empty_folder.is_dir()
+
+
+def test_revert_zero_byte_file_removal():
+    """Test that reverting zero-byte file removal recreates the files"""
+    output_manager = OutputManager()
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        
+        # Create zero-byte file
+        zero_file = tmp_path / "zero.txt"
+        zero_file.touch()
+        
+        # Remove zero-byte files (not simulation)
+        remove_zero_byte_files(tmp_path, simulate=False, recurse=True, output_manager=output_manager)
+        
+        # Verify file was removed
+        assert not zero_file.exists()
+        
+        # Get the log file
+        log_files = list(tmp_path.glob("levelzap.log.*.json"))
+        assert len(log_files) == 1
+        
+        # Import revert function
+        from levelzap import revert_log
+        
+        # Revert the operation
+        revert_log(log_files[0], keep_log=False, output_manager=output_manager)
+        
+        # Verify file was recreated as zero-byte file
+        assert zero_file.exists()
+        assert zero_file.stat().st_size == 0
+
+
+def test_combined_operations_with_recurse():
+    """Test both operations together with recursive option"""
+    output_manager = OutputManager()
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        
+        # Create complex structure
+        deep_empty = tmp_path / "level1" / "level2" / "empty"
+        deep_empty.mkdir(parents=True)
+        
+        zero_deep = tmp_path / "level1" / "zero_deep.txt"
+        zero_deep.touch()
+        
+        shallow_empty = tmp_path / "empty_shallow"
+        shallow_empty.mkdir()
+        
+        zero_shallow = tmp_path / "zero_shallow.txt"
+        zero_shallow.touch()
+        
+        normal_file = tmp_path / "normal.txt"
+        normal_file.write_text("content")
+        
+        # Test empty folder removal with recursion
+        remove_empty_folders(tmp_path, simulate=True, recurse=True, output_manager=output_manager)
+        
+        # Test zero-byte file removal with recursion
+        remove_zero_byte_files(tmp_path, simulate=True, recurse=True, output_manager=output_manager)
+        
+        # Check both log files were created (they may share same timestamp)
+        log_files = list(tmp_path.glob("levelzap.log.*.json"))
+        assert len(log_files) >= 1  # At least one log file should exist
+        
+        # Read the last log file which should contain zero-byte file removal
+        with open(log_files[-1], 'r') as f:
+            last_log_data = json.load(f)
+        
+        # The last operation should be zero-byte file removal
+        assert last_log_data["meta"]["operation"] == "remove_zero_byte_files"
+        delete_actions = [action for action in last_log_data["actions"] if action["action"] == "delete_zero_file"]
+        assert len(delete_actions) == 2  # zero_shallow and zero_deep

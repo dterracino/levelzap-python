@@ -143,6 +143,10 @@ def parse_args():
     # Analysis operations
     parser.add_argument("--size", action="store_true", help="Calculate complete size of all files in the path")
     parser.add_argument("--count", action="store_true", help="Calculate number of files in the path")
+    
+    # Cleanup operations
+    parser.add_argument("--remove-empty", action="store_true", help="Remove empty folders")
+    parser.add_argument("--remove-zero", action="store_true", help="Remove zero byte files")
 
     # Duplicate handling
     parser.add_argument("--duplicate-strategy", choices=["overwrite", "rename", "newest", "oldest", "largest", "smallest"], 
@@ -225,6 +229,24 @@ def perform_action(simulate, action_type, src=None, dst=None, log=None, extra=No
                 src.rmdir()
             except OSError as e:
                 warning_msg = f"Could not delete folder (not empty?): {src}"
+                if output_manager:
+                    output_manager.print_warning(warning_msg)
+                else:
+                    print(f"⚠️  {warning_msg}")
+        elif action_type == "delete_empty_folder":
+            try:
+                src.rmdir()
+            except OSError as e:
+                warning_msg = f"Could not delete empty folder: {src}"
+                if output_manager:
+                    output_manager.print_warning(warning_msg)
+                else:
+                    print(f"⚠️  {warning_msg}")
+        elif action_type == "delete_zero_file":
+            try:
+                src.unlink()
+            except OSError as e:
+                warning_msg = f"Could not delete zero-byte file: {src}"
                 if output_manager:
                     output_manager.print_warning(warning_msg)
                 else:
@@ -532,6 +554,14 @@ def revert_log(log_path: Path, keep_log=False, output_manager=None):
             elif act_type == "delete_folder":
                 path = Path(action["source"])
                 path.mkdir(parents=True, exist_ok=True)
+            elif act_type == "delete_empty_folder":
+                path = Path(action["source"])
+                path.mkdir(parents=True, exist_ok=True)
+            elif act_type == "delete_zero_file":
+                # Cannot restore content of zero-byte file, but create empty file
+                path = Path(action["source"])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
             elif act_type.startswith("overwrite"):
                 output_manager.print_warning(f"Cannot revert overwrite: {action.get('source', 'unknown')}")
                 continue
@@ -649,6 +679,162 @@ def check_for_update(output_manager=None):
     except Exception as e:
         output_manager.print_error(f"Could not check for update: {e}")
 
+def remove_empty_folders(root: Path, simulate=False, recurse=False, output_manager=None):
+    """Remove empty folders with improved error handling and output management"""
+    if output_manager is None:
+        output_manager = OutputManager()
+    
+    try:
+        log_file = get_log_filename()
+        actions = []
+        
+        # Find empty folders
+        empty_folders = []
+        if recurse:
+            # Find all directories recursively, check from deepest first
+            all_dirs = [d for d in root.rglob('*') if d.is_dir() and d != root]
+            all_dirs.sort(key=lambda x: len(x.parts), reverse=True)  # Deepest first
+        else:
+            # Only check immediate subdirectories
+            all_dirs = [d for d in root.iterdir() if d.is_dir()]
+        
+        # Check which folders are empty
+        for folder in all_dirs:
+            try:
+                if not any(folder.iterdir()):  # Check if folder is empty
+                    empty_folders.append(folder)
+            except OSError:
+                # Skip folders we can't read
+                continue
+        
+        if not empty_folders:
+            operation_type = "recursive empty folder cleanup" if recurse else "empty folder cleanup"
+            output_manager.print_success(f"No empty folders found for {operation_type}")
+            return
+        
+        operation_type = "recursive empty folder removal" if recurse else "empty folder removal"
+        output_manager.print_operation_start(operation_type, len(empty_folders), root, simulate)
+        
+        # Remove empty folders
+        with tqdm(total=len(empty_folders), desc="Removing empty folders", unit="folder") as pbar:
+            for folder in empty_folders:
+                try:
+                    perform_action(simulate, "delete_empty_folder", src=folder, log=actions, output_manager=output_manager)
+                    pbar.update(1)
+                except Exception as e:
+                    output_manager.print_error(f"Error removing empty folder {folder}: {e}")
+                    continue
+        
+        # Write log file
+        log_path = root / log_file
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                meta = {
+                    "version": LEVELZAP_VERSION,
+                    "log_timestamp": datetime.now().isoformat(),
+                    "simulated": simulate,
+                    "recursive": recurse,
+                    "operation": "remove_empty_folders"
+                }
+                log_data = {
+                    "meta": meta,
+                    "actions": actions
+                }
+                raw_log = json.dumps(log_data, indent=2).encode("utf-8")
+                log_data["meta"]["hash"] = hashlib.sha256(raw_log).hexdigest()
+                f.write(json.dumps(log_data, indent=2))
+            
+            output_manager.print_log_completion(log_path, simulate)
+        except Exception as e:
+            output_manager.print_error(f"Failed to write log file: {e}")
+    
+    except Exception as e:
+        if output_manager:
+            output_manager.print_error(f"Error during empty folder removal: {e}")
+        else:
+            print(f"❌ Error during empty folder removal: {e}")
+
+def remove_zero_byte_files(root: Path, simulate=False, recurse=False, output_manager=None):
+    """Remove zero-byte files with improved error handling and output management"""
+    if output_manager is None:
+        output_manager = OutputManager()
+    
+    try:
+        log_file = get_log_filename()
+        actions = []
+        
+        # Find zero-byte files
+        zero_byte_files = []
+        if recurse:
+            # Find all files recursively
+            all_files = [f for f in root.rglob('*') if f.is_file()]
+        else:
+            # Only check immediate files and files in subdirectories (one level deep)
+            all_files = []
+            for item in root.iterdir():
+                if item.is_file():
+                    all_files.append(item)
+                elif item.is_dir():
+                    for subitem in item.iterdir():
+                        if subitem.is_file():
+                            all_files.append(subitem)
+        
+        # Check which files are zero-byte
+        for file_path in all_files:
+            try:
+                if file_path.stat().st_size == 0:
+                    zero_byte_files.append(file_path)
+            except OSError:
+                # Skip files we can't read
+                continue
+        
+        if not zero_byte_files:
+            operation_type = "recursive zero-byte file cleanup" if recurse else "zero-byte file cleanup"
+            output_manager.print_success(f"No zero-byte files found for {operation_type}")
+            return
+        
+        operation_type = "recursive zero-byte file removal" if recurse else "zero-byte file removal"
+        output_manager.print_operation_start(operation_type, len(zero_byte_files), root, simulate)
+        
+        # Remove zero-byte files
+        with tqdm(total=len(zero_byte_files), desc="Removing zero-byte files", unit="file") as pbar:
+            for file_path in zero_byte_files:
+                try:
+                    perform_action(simulate, "delete_zero_file", src=file_path, log=actions, output_manager=output_manager)
+                    pbar.update(1)
+                except Exception as e:
+                    output_manager.print_error(f"Error removing zero-byte file {file_path}: {e}")
+                    continue
+        
+        # Write log file
+        log_path = root / log_file
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                meta = {
+                    "version": LEVELZAP_VERSION,
+                    "log_timestamp": datetime.now().isoformat(),
+                    "simulated": simulate,
+                    "recursive": recurse,
+                    "operation": "remove_zero_byte_files"
+                }
+                log_data = {
+                    "meta": meta,
+                    "actions": actions
+                }
+                raw_log = json.dumps(log_data, indent=2).encode("utf-8")
+                log_data["meta"]["hash"] = hashlib.sha256(raw_log).hexdigest()
+                f.write(json.dumps(log_data, indent=2))
+            
+            output_manager.print_log_completion(log_path, simulate)
+        except Exception as e:
+            output_manager.print_error(f"Failed to write log file: {e}")
+    
+    except Exception as e:
+        if output_manager:
+            output_manager.print_error(f"Error during zero-byte file removal: {e}")
+        else:
+            print(f"❌ Error during zero-byte file removal: {e}")
+
 def display_user_selections(args, output_manager):
     """Display the user's selected options"""
     output_manager.print_info("🔧 Operation Details:")
@@ -673,6 +859,12 @@ def display_user_selections(args, output_manager):
     
     if args.size or args.count:
         output_manager.print_info("   Analysis operations requested")
+    
+    if hasattr(args, 'remove_empty') and args.remove_empty:
+        output_manager.print_info("   Cleanup: 🗂️ Remove empty folders")
+    
+    if hasattr(args, 'remove_zero') and args.remove_zero:
+        output_manager.print_info("   Cleanup: 📄 Remove zero-byte files")
     
     output_manager.print_info("")
 
@@ -712,6 +904,28 @@ def main():
             if args.size or args.count:
                 sys.exit(0)
 
+        # Handle cleanup operations
+        if hasattr(args, 'remove_empty') and args.remove_empty or hasattr(args, 'remove_zero') and args.remove_zero:
+            target_path = Path(args.target).resolve()
+            ensure_valid_directory(target_path, output_manager)
+            
+            display_user_selections(args, output_manager)
+            
+            if hasattr(args, 'remove_empty') and args.remove_empty:
+                try:
+                    remove_empty_folders(target_path, simulate=args.dry_run, recurse=args.recurse, output_manager=output_manager)
+                except Exception as e:
+                    output_manager.print_error(f"Empty folder removal failed: {e}")
+            
+            if hasattr(args, 'remove_zero') and args.remove_zero:
+                try:
+                    remove_zero_byte_files(target_path, simulate=args.dry_run, recurse=args.recurse, output_manager=output_manager)
+                except Exception as e:
+                    output_manager.print_error(f"Zero-byte file removal failed: {e}")
+            
+            if (hasattr(args, 'remove_empty') and args.remove_empty) or (hasattr(args, 'remove_zero') and args.remove_zero):
+                sys.exit(0)
+
         # Handle other operations
         if args.list_logs:
             list_logs(Path(args.target).resolve(), output_manager)
@@ -740,8 +954,15 @@ def main():
             revert_log(log_files[0], keep_log=args.keep_logs, output_manager=output_manager)
         else:
             # Default to levelzap operation if no other operation is specified, or if --levelzap is explicitly provided
-            should_levelzap = (not any([args.revert_all, args.revert, args.list_logs, args.verify, args.update, args.size, args.count]) 
+            should_levelzap = (not any([args.revert_all, args.revert, args.list_logs, args.verify, args.update, args.size, args.count, 
+                                      getattr(args, 'remove_empty', False), getattr(args, 'remove_zero', False)]) 
                              or (hasattr(args, 'levelzap') and args.levelzap))
+            
+            if should_levelzap:
+                flatten_folder(target_path, simulate=args.dry_run, merge=args.merge, 
+                             overwrite=args.overwrite, recurse=args.recurse,
+                             duplicate_strategy=getattr(args, 'duplicate_strategy', 'rename'),
+                             output_manager=output_manager)
               
     except KeyboardInterrupt:
         output_manager.print_warning("Operation cancelled by user")

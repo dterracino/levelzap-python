@@ -137,9 +137,16 @@ def parse_args():
     parser.add_argument("-kl", "--keep-logs", action="store_true", help="Preserve log files after reversion (they will be marked as reverted)")
     parser.add_argument("--recurse", action="store_true", help="Apply recursive logic to all operations")
     
+    # Core operations
+    parser.add_argument("--levelzap", action="store_true", help="Perform levelzap operation (flatten subfolders)")
+    
     # Analysis operations
     parser.add_argument("--size", action="store_true", help="Calculate complete size of all files in the path")
     parser.add_argument("--count", action="store_true", help="Calculate number of files in the path")
+
+    # Duplicate handling
+    parser.add_argument("--duplicate-strategy", choices=["overwrite", "rename", "newest", "oldest", "largest", "smallest"], 
+                       default="rename", help="Strategy for handling duplicate files (default: rename)")
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-m", "--merge", action="store_true", help="Merge folders if names conflict")
@@ -168,8 +175,13 @@ def ensure_valid_directory(path, output_manager=None):
             print(f"❌ {error_msg}")
         sys.exit(1)
 
-def resolve_conflict_path(path: Path) -> Path:
-    if not path.exists():
+def resolve_conflict_path(path: Path, simulated_files=None) -> Path:
+    """Resolve conflict by finding a non-conflicting path name"""
+    # Check both actual files and simulated files (for simulation mode)
+    def path_would_exist(p):
+        return p.exists() or (simulated_files and str(p) in simulated_files)
+    
+    if not path_would_exist(path):
         return path
     base = path.stem
     ext = path.suffix
@@ -178,7 +190,7 @@ def resolve_conflict_path(path: Path) -> Path:
     while True:
         new_name = f"{base}_{i}{ext}"
         new_path = parent / new_name
-        if not new_path.exists():
+        if not path_would_exist(new_path):
             return new_path
         i += 1
 
@@ -228,7 +240,41 @@ def get_log_filename():
     epoch_seconds = int(datetime.now().timestamp())
     return f"levelzap.log.{epoch_seconds}.json"
 
-def flatten_folder(root: Path, simulate=False, merge=False, overwrite=False, output_manager=None):
+def resolve_duplicate_file(existing_path: Path, new_path: Path, strategy: str, output_manager=None) -> Path:
+    """Resolve duplicate files based on the specified strategy"""
+    if strategy == "overwrite":
+        return new_path  # Use new file, will overwrite existing
+    elif strategy == "rename":
+        return resolve_conflict_path(existing_path, None)  # Rename the new file
+    elif strategy in ["newest", "oldest", "largest", "smallest"]:
+        try:
+            existing_stat = existing_path.stat()
+            new_stat = new_path.stat()
+            
+            if strategy == "newest":
+                keep_existing = existing_stat.st_mtime >= new_stat.st_mtime
+            elif strategy == "oldest":
+                keep_existing = existing_stat.st_mtime <= new_stat.st_mtime
+            elif strategy == "largest":
+                keep_existing = existing_stat.st_size >= new_stat.st_size
+            elif strategy == "smallest":
+                keep_existing = existing_stat.st_size <= new_stat.st_size
+            
+            if keep_existing:
+                # Keep existing, don't move new file (return None to indicate skip)
+                return None
+            else:
+                # Replace existing with new file
+                return existing_path
+        except OSError as e:
+            if output_manager:
+                output_manager.print_warning(f"Could not compare files, falling back to rename: {e}")
+            return resolve_conflict_path(existing_path, None)
+    
+    # Fallback to rename strategy
+    return resolve_conflict_path(existing_path, None)
+
+def flatten_folder(root: Path, simulate=False, merge=False, overwrite=False, recurse=False, duplicate_strategy="rename", output_manager=None):
     """Flatten subfolders with improved error handling and output management"""
     if output_manager is None:
         output_manager = OutputManager()
@@ -236,54 +282,171 @@ def flatten_folder(root: Path, simulate=False, merge=False, overwrite=False, out
     try:
         log_file = get_log_filename()
         actions = []
-        subfolders = [f for f in root.iterdir() if f.is_dir()]
-        total_items = sum(len(list(f.iterdir())) for f in subfolders)
         
-        output_manager.print_operation_start("flatten", len(subfolders), root, simulate)
+        if recurse:
+            # Collect all files from all subdirectories recursively
+            all_files = []
+            all_folders_to_delete = set()
+            
+            for item in root.rglob('*'):
+                if item.is_file():
+                    all_files.append(item)
+                elif item.is_dir() and item != root:
+                    all_folders_to_delete.add(item)
+            
+            total_items = len(all_files)
+            operation_type = "recursive flatten"
+        else:
+            # Original behavior: only flatten immediate subfolders
+            subfolders = [f for f in root.iterdir() if f.is_dir()]
+            total_items = sum(len(list(f.iterdir())) for f in subfolders)
+            operation_type = "flatten"
+        
+        output_manager.print_operation_start(operation_type, 
+                                           len(all_files) if recurse else len(subfolders) if not recurse else 0, 
+                                           root, simulate)
         
         with tqdm(total=total_items, desc="Flattening", unit="item") as pbar:
-            for folder in subfolders:
-                try:
-                    for item in folder.iterdir():
-                        destination = root / item.name
-                        if destination.exists():
-                            if destination.is_dir() and item.is_dir():
-                                if merge:
-                                    for subitem in item.iterdir():
-                                        dest_sub = destination / subitem.name
-                                        if dest_sub.exists():
-                                            if overwrite:
-                                                perform_action(simulate, "overwrite_file", src=subitem, dst=dest_sub, log=actions, output_manager=output_manager)
-                                                pbar.update(1)
-                                                continue
-                                            else:
-                                                dest_sub = resolve_conflict_path(dest_sub)
-                                        perform_action(simulate, "move", src=subitem, dst=dest_sub, log=actions, output_manager=output_manager)
-                                        pbar.update(1)
-                                    perform_action(simulate, "delete_folder", src=item, log=actions, output_manager=output_manager)
-                                    continue
-                                elif overwrite:
-                                    perform_action(simulate, "overwrite_folder", src=item, dst=destination, log=actions, output_manager=output_manager)
-                                    pbar.update(1)
-                                    continue
-                                else:
-                                    destination = resolve_conflict_path(destination)
-                            elif destination.is_file() or item.is_file():
-                                if overwrite:
-                                    perform_action(simulate, "overwrite_file", src=item, dst=destination, log=actions, output_manager=output_manager)
-                                    pbar.update(1)
-                                    continue
-                                else:
-                                    new_path = resolve_conflict_path(destination)
-                                    perform_action(simulate, "move_renamed", src=item, dst=new_path, log=actions, extra={"original_conflict": str(destination)}, output_manager=output_manager)
-                                    pbar.update(1)
-                                    continue
-                        perform_action(simulate, "move", src=item, dst=destination, log=actions, output_manager=output_manager)
+            if recurse:
+                # Group files by their destination names to detect conflicts
+                files_by_destination = {}
+                simulated_destinations = set()  # Track simulated file destinations
+                
+                for file_path in all_files:
+                    dest_name = file_path.name
+                    if dest_name not in files_by_destination:
+                        files_by_destination[dest_name] = []
+                    files_by_destination[dest_name].append(file_path)
+                
+                # Process each group of files with the same destination name
+                for dest_name, files_list in files_by_destination.items():
+                    destination = root / dest_name
+                    
+                    if len(files_list) == 1:
+                        # No conflict, single file with this name
+                        file_path = files_list[0]
+                        if destination.exists() and destination != file_path:
+                            # Conflict with existing file in root
+                            resolved_dest = resolve_duplicate_file(destination, file_path, duplicate_strategy, output_manager)
+                            if resolved_dest is None:
+                                # Skip this file (keep existing)
+                                pbar.update(1)
+                                continue
+                            elif resolved_dest == destination and duplicate_strategy == "overwrite":
+                                perform_action(simulate, "overwrite_file", src=file_path, dst=destination, log=actions, output_manager=output_manager)
+                            else:
+                                # Move with new name
+                                perform_action(simulate, "move_renamed", src=file_path, dst=resolved_dest, log=actions, 
+                                             extra={"original_conflict": str(destination), "strategy": duplicate_strategy}, output_manager=output_manager)
+                        else:
+                            # No conflict, regular move
+                            perform_action(simulate, "move", src=file_path, dst=destination, log=actions, output_manager=output_manager)
+                            simulated_destinations.add(str(destination))
                         pbar.update(1)
-                    perform_action(simulate, "delete_folder", src=folder, log=actions, output_manager=output_manager)
-                except Exception as e:
-                    output_manager.print_error(f"Error processing folder {folder}: {e}")
-                    continue
+                    else:
+                        # Multiple files with same name - handle conflicts
+                        if duplicate_strategy in ["newest", "oldest", "largest", "smallest"]:
+                            # Choose the best file based on strategy
+                            best_file = files_list[0]
+                            for file_path in files_list[1:]:
+                                try:
+                                    best_stat = best_file.stat()
+                                    curr_stat = file_path.stat()
+                                    
+                                    if duplicate_strategy == "newest":
+                                        if curr_stat.st_mtime > best_stat.st_mtime:
+                                            best_file = file_path
+                                    elif duplicate_strategy == "oldest":
+                                        if curr_stat.st_mtime < best_stat.st_mtime:
+                                            best_file = file_path
+                                    elif duplicate_strategy == "largest":
+                                        if curr_stat.st_size > best_stat.st_size:
+                                            best_file = file_path
+                                    elif duplicate_strategy == "smallest":
+                                        if curr_stat.st_size < best_stat.st_size:
+                                            best_file = file_path
+                                except OSError:
+                                    # If we can't stat, keep current best
+                                    continue
+                            
+                            # Move the best file
+                            perform_action(simulate, "move", src=best_file, dst=destination, log=actions, 
+                                         extra={"strategy": duplicate_strategy, "chosen_from": [str(f) for f in files_list]}, 
+                                         output_manager=output_manager)
+                            simulated_destinations.add(str(destination))
+                            pbar.update(len(files_list))
+                        else:
+                            # Rename strategy or overwrite - move first file normally, rename others
+                            perform_action(simulate, "move", src=files_list[0], dst=destination, log=actions, output_manager=output_manager)
+                            simulated_destinations.add(str(destination))
+                            
+                            for file_path in files_list[1:]:
+                                if duplicate_strategy == "overwrite":
+                                    perform_action(simulate, "overwrite_file", src=file_path, dst=destination, log=actions, output_manager=output_manager)
+                                else:
+                                    # Rename strategy
+                                    renamed_dest = resolve_conflict_path(destination, simulated_destinations)
+                                    perform_action(simulate, "move_renamed", src=file_path, dst=renamed_dest, log=actions,
+                                                 extra={"original_conflict": str(destination), "strategy": duplicate_strategy}, 
+                                                 output_manager=output_manager)
+                                    simulated_destinations.add(str(renamed_dest))
+                            pbar.update(len(files_list))
+                
+                # Delete all empty folders in reverse order (deepest first)
+                sorted_folders = sorted(all_folders_to_delete, key=lambda x: len(x.parts), reverse=True)
+                for folder in sorted_folders:
+                    try:
+                        if folder.exists():  # Check if still exists (may have been deleted already)
+                            perform_action(simulate, "delete_folder", src=folder, log=actions, output_manager=output_manager)
+                    except Exception as e:
+                        output_manager.print_error(f"Error deleting folder {folder}: {e}")
+                        continue
+                        
+            else:
+                # Original non-recursive behavior
+                subfolders = [f for f in root.iterdir() if f.is_dir()]
+                for folder in subfolders:
+                    try:
+                        for item in folder.iterdir():
+                            destination = root / item.name
+                            if destination.exists():
+                                if destination.is_dir() and item.is_dir():
+                                    if merge:
+                                        for subitem in item.iterdir():
+                                            dest_sub = destination / subitem.name
+                                            if dest_sub.exists():
+                                                if overwrite:
+                                                    perform_action(simulate, "overwrite_file", src=subitem, dst=dest_sub, log=actions, output_manager=output_manager)
+                                                    pbar.update(1)
+                                                    continue
+                                                else:
+                                                    dest_sub = resolve_conflict_path(dest_sub)
+                                            perform_action(simulate, "move", src=subitem, dst=dest_sub, log=actions, output_manager=output_manager)
+                                            pbar.update(1)
+                                        perform_action(simulate, "delete_folder", src=item, log=actions, output_manager=output_manager)
+                                        continue
+                                    elif overwrite:
+                                        perform_action(simulate, "overwrite_folder", src=item, dst=destination, log=actions, output_manager=output_manager)
+                                        pbar.update(1)
+                                        continue
+                                    else:
+                                        destination = resolve_conflict_path(destination, None)
+                                elif destination.is_file() or item.is_file():
+                                    if overwrite:
+                                        perform_action(simulate, "overwrite_file", src=item, dst=destination, log=actions, output_manager=output_manager)
+                                        pbar.update(1)
+                                        continue
+                                    else:
+                                        new_path = resolve_conflict_path(destination, None)
+                                        perform_action(simulate, "move_renamed", src=item, dst=new_path, log=actions, extra={"original_conflict": str(destination)}, output_manager=output_manager)
+                                        pbar.update(1)
+                                        continue
+                            perform_action(simulate, "move", src=item, dst=destination, log=actions, output_manager=output_manager)
+                            pbar.update(1)
+                        perform_action(simulate, "delete_folder", src=folder, log=actions, output_manager=output_manager)
+                    except Exception as e:
+                        output_manager.print_error(f"Error processing folder {folder}: {e}")
+                        continue
         
         # Write log file
         log_path = root / log_file
@@ -292,7 +455,9 @@ def flatten_folder(root: Path, simulate=False, merge=False, overwrite=False, out
                 meta = {
                     "version": LEVELZAP_VERSION,
                     "log_timestamp": datetime.now().isoformat(),
-                    "simulated": simulate
+                    "simulated": simulate,
+                    "recursive": recurse,
+                    "duplicate_strategy": duplicate_strategy
                 }
                 log_data = {
                     "meta": meta,
@@ -492,8 +657,14 @@ def display_user_selections(args, output_manager):
     if args.dry_run:
         output_manager.print_info("   Mode: 🔍 Simulation (no changes will be made)")
     
+    if hasattr(args, 'levelzap') and args.levelzap:
+        output_manager.print_info("   Operation: LevelZap (flatten directories)")
+    
     if args.recurse:
         output_manager.print_info("   Recursive: ✅ Enabled")
+    
+    if hasattr(args, 'duplicate_strategy') and args.duplicate_strategy:
+        output_manager.print_info(f"   Duplicate strategy: {args.duplicate_strategy}")
     
     if args.merge:
         output_manager.print_info("   Merge conflicts: ✅ Enabled")
@@ -568,21 +739,10 @@ def main():
                 sys.exit(1)
             revert_log(log_files[0], keep_log=args.keep_logs, output_manager=output_manager)
         else:
-            if args.overwrite:
-                output_manager.print_overwrite_warning()
-                confirm = input("Type YES to continue: ")
-                if confirm.strip() != "YES":
-                    output_manager.print_error("Aborted by user.")
-                    sys.exit(0)
-            
-            flatten_folder(
-                target_path,
-                simulate=args.dry_run,
-                merge=args.merge,
-                overwrite=args.overwrite,
-                output_manager=output_manager
-            )
-    
+            # Default to levelzap operation if no other operation is specified, or if --levelzap is explicitly provided
+            should_levelzap = (not any([args.revert_all, args.revert, args.list_logs, args.verify, args.update, args.size, args.count]) 
+                             or (hasattr(args, 'levelzap') and args.levelzap))
+              
     except KeyboardInterrupt:
         output_manager.print_warning("Operation cancelled by user")
         sys.exit(1)

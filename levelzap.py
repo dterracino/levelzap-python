@@ -131,7 +131,7 @@ def parse_args():
         description="📂 LevelZap - Flatten subfolders up one level and clean up."
     )
     parser.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir)")
-    parser.add_argument("-s", "--simulate", action="store_true", help="Simulate actions without making changes")
+    parser.add_argument("-s", "--dry-run", action="store_true", help="Simulate actions without making changes")
     parser.add_argument("-r", "--revert", action="store_true", help="Revert the most recent log file")
     parser.add_argument("-ra", "--revert-all", action="store_true", help="Revert all previous operations in reverse order")
     parser.add_argument("-kl", "--keep-logs", action="store_true", help="Preserve log files after reversion (they will be marked as reverted)")
@@ -654,7 +654,7 @@ def display_user_selections(args, output_manager):
     output_manager.print_info("🔧 Operation Details:")
     output_manager.print_info(f"   Target directory: {args.target}")
     
-    if args.simulate:
+    if args.dry_run:
         output_manager.print_info("   Mode: 🔍 Simulation (no changes will be made)")
     
     if hasattr(args, 'levelzap') and args.levelzap:
@@ -742,30 +742,7 @@ def main():
             # Default to levelzap operation if no other operation is specified, or if --levelzap is explicitly provided
             should_levelzap = (not any([args.revert_all, args.revert, args.list_logs, args.verify, args.update, args.size, args.count]) 
                              or (hasattr(args, 'levelzap') and args.levelzap))
-            
-            if should_levelzap:
-                if args.overwrite:
-                    output_manager.print_overwrite_warning()
-                    confirm = input("Type YES to continue: ")
-                    if confirm.strip() != "YES":
-                        output_manager.print_error("Aborted by user.")
-                        sys.exit(0)
-                
-                # Determine duplicate strategy - use --duplicate-strategy if available, otherwise fall back to legacy options
-                duplicate_strategy = getattr(args, 'duplicate_strategy', 'rename')
-                if args.overwrite:
-                    duplicate_strategy = 'overwrite'
-                
-                flatten_folder(
-                    target_path,
-                    simulate=args.simulate,
-                    merge=args.merge,
-                    overwrite=args.overwrite,
-                    recurse=args.recurse,
-                    duplicate_strategy=duplicate_strategy,
-                    output_manager=output_manager
-                )
-    
+              
     except KeyboardInterrupt:
         output_manager.print_warning("Operation cancelled by user")
         sys.exit(1)
